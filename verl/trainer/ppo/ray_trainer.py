@@ -14,6 +14,14 @@
 """
 FSDP PPO Trainer with Ray-based single controller.
 This trainer supports model-agonistic model initialization with huggingface
+
+Reading guide (important for Search-R1 development):
+1) `fit()` is the main PPO dataflow (generate -> reward -> advantage -> update).
+2) `if not self.config.do_search` is close to the vanilla veRL rollout path.
+3) `else` branch under `do_search` is the Search-R1 extension path:
+    multi-turn tool calling (`<search>...</search>`) via `LLMGenerationManager`.
+4) `_create_loss_mask()` is Search-R1-specific masking logic that can exclude
+    retrieval observation tokens from actor loss when `state_masking=True`.
 """
 
 import os
@@ -45,6 +53,7 @@ from search_r1.llm_agent.generation import LLMGenerationManager, GenerationConfi
 WorkerType = Type[Worker]
 
 
+# なんかめっちゃProtoっぽい作り方じゃない？
 class Role(Enum):
     """
     To create more roles dynamically, you can subclass Role and add new members
@@ -57,7 +66,8 @@ class Role(Enum):
     RewardModel = 5
     ActorRolloutRef = 6
 
-
+# GPUのリソースプール管理
+# GPU, CPUリソースの確保をし、その予約チケット管理する
 @dataclass
 class ResourcePoolManager:
     """
@@ -87,7 +97,7 @@ class ResourcePoolManager:
 import torch
 from verl.utils.torch_functional import masked_mean
 
-
+# 過去の方策と現在の方策のKLダイバージェンスを計算して、PPOの損失関数にペナルティを加えるための関数
 def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, kl_penalty='kl'):
     responses = data.batch['responses']
     response_length = responses.size(1)
@@ -262,7 +272,9 @@ def compute_data_metrics(batch, use_critic=True):
             torch.mean(torch.eq(prompt_length, max_prompt_length).float()).detach().item(),
     }
 
-    # metrics for actions
+    # Search-R1 extension: these env metrics are produced by the multi-turn
+    # generation manager (turn count, valid action ratio, valid search count).
+    # They do not exist in the vanilla single-shot rollout path.
     if 'turns_stats' in batch.meta_info:
         metrics['env/number_of_actions/mean'] = float(np.array(batch.meta_info['turns_stats'], dtype=np.int16).mean())
         metrics['env/number_of_actions/max'] = float(np.array(batch.meta_info['turns_stats'], dtype=np.int16).max())
@@ -433,6 +445,7 @@ class RayPPOTrainer(object):
             self.config.actor_rollout_ref.actor.optim.total_training_steps = total_training_steps
             self.config.critic.optim.total_training_steps = total_training_steps
 
+    # 生成をして、生成結果を元バッチに結合する。そのあと、報酬計算して集計
     def _validate(self):
         """
         The training loop of PPO with global metric computation.
@@ -442,6 +455,7 @@ class RayPPOTrainer(object):
         reward_tensor_lst = []
         data_source_lst = []
 
+        # Search-R1 extension config for multi-turn generation + retrieval.
         gen_config = GenerationConfig(
             max_turns=self.config.max_turns,
             max_start_length=self.config.data.max_start_length,
@@ -454,7 +468,8 @@ class RayPPOTrainer(object):
             topk = self.config.retriever.topk,
         )
 
-        # Agent config preparation
+        # Search-R1 extension: manager executes an LLM <search>/<answer> loop,
+        # calls retrieval API when needed, and returns merged trajectories.
         generation_manager = LLMGenerationManager(
             tokenizer=self.tokenizer,
             actor_rollout_wg=self.actor_rollout_wg,
@@ -462,6 +477,7 @@ class RayPPOTrainer(object):
             is_validation = True,
         )
 
+        # Vanilla path (no tool use): single rollout generation.
         if not self.config.do_search:
             for test_data in self.val_dataloader:
                 test_batch = DataProto.from_single_dict(test_data)
@@ -494,6 +510,7 @@ class RayPPOTrainer(object):
 
                 reward_tensor_lst.append(reward_tensor)
                 data_source_lst.append(test_batch.non_tensor_batch.get('data_source', ['unknown'] * reward_tensor.shape[0]))
+        # Search-R1 path (tool use enabled): multi-turn generation loop.
         else:
             for batch_dict in self.val_dataloader:
                 timing_raw = {}
@@ -519,6 +536,7 @@ class RayPPOTrainer(object):
                     
                     test_batch = test_batch.union(final_gen_batch_output)
                     
+                    # Keep tensor dtype consistent for downstream worker RPC.
                     for key in test_batch.batch.keys():
                         test_batch.batch[key] = test_batch.batch[key].long()
                     
@@ -662,6 +680,7 @@ class RayPPOTrainer(object):
         self.global_steps = 0
         # perform validation before training
         # currently, we only support validation using the reward_function.
+        # ベースラインスコアの取得 val_only=Trueにすることで推論専用にも切り替え可能
         if self.val_reward_fn is not None and self.config.trainer.get('val_before_train', True):
             val_metrics = self._validate()
             pprint(f'Initial validation metrics: {val_metrics}')
@@ -672,7 +691,7 @@ class RayPPOTrainer(object):
         # we start from step 1
         self.global_steps += 1
 
-        # Agent config preparation
+        # Search-R1 extension config for interactive (multi-turn) rollout.
         gen_config = GenerationConfig(
             max_turns=self.config.max_turns,
             max_start_length=self.config.data.max_start_length,
@@ -685,6 +704,7 @@ class RayPPOTrainer(object):
             topk = self.config.retriever.topk,
         )
 
+        # Search-R1 extension runtime manager for tool-use trajectories.
         generation_manager = LLMGenerationManager(
             tokenizer=self.tokenizer,
             actor_rollout_wg=self.actor_rollout_wg,
@@ -699,15 +719,16 @@ class RayPPOTrainer(object):
                 timing_raw = {}
 
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
-                batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n_agent, interleave=True)
+                batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n_agent, interleave=True) #複数サンプル生成のため
 
                 # pop those keys for generation
                 gen_batch = batch.pop(batch_keys=['input_ids', 'attention_mask', 'position_ids'])
 
-                ####################
-                # original code here
-
                 with _timer('step', timing_raw):
+                    # --------------------
+                    # Vanilla veRL path.
+                    # One-shot generation from current policy.
+                    # --------------------
                     if not self.config.do_search:
                         gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
 
@@ -717,13 +738,14 @@ class RayPPOTrainer(object):
                         batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                         batch = batch.union(gen_batch_output)
 
-                ####################
-                # Below is aLL about agents - the "LLM + forloop"
-                ####################
-                # with _timer('step', timing_raw):
+                    # --------------------
+                    # Search-R1 extension path.
+                    # Multi-turn LLM loop with optional retrieval calls.
+                    # --------------------
                     else:
                         first_input_ids = gen_batch.batch['input_ids'][:, -gen_config.max_start_length:].clone().long()
 
+                        # マルチターンの生成（検索あり）を実行して、最終的な生成結果と軌跡を取得
                         with _timer('gen', timing_raw):
                             generation_manager.timing_raw = timing_raw
                             final_gen_batch_output = generation_manager.run_llm_loop(
@@ -735,20 +757,21 @@ class RayPPOTrainer(object):
                         for key in final_gen_batch_output.batch.keys():
                             final_gen_batch_output.batch[key] = final_gen_batch_output.batch[key].long()
 
+                        # Search-R1 explicit log-prob recomputation:
+                        # run_llm_loop returns final trajectories, then we query
+                        # actor for token log-prob to train PPO objectives.
                         with torch.no_grad():
                             output = self.actor_rollout_wg.compute_log_prob(final_gen_batch_output)
                             final_gen_batch_output = final_gen_batch_output.union(output)
 
-                        # batch.non_tensor_batch['uid'] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))],
-                        #                                         dtype=object)
+                        # Search-R1 uses dataset `index` as uid for grouped
+                        # advantage bookkeeping (especially useful for GRPO-like
+                        # grouping semantics).
                         batch.non_tensor_batch['uid'] = batch.non_tensor_batch['index'].copy()
                                             
                         # repeat to align with repeated responses in rollout
-                        batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
-                        batch = batch.union(final_gen_batch_output)
-
-                    ####################
-                    ####################
+                        batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True) # advantageグループの形成
+                        batch = batch.union(final_gen_batch_output) # 生成結果を元バッチに結合
 
                     # balance the number of valid tokens on each dp rank.
                     # Note that this breaks the order of data inside the batch.
@@ -766,13 +789,13 @@ class RayPPOTrainer(object):
                     if self.use_reference_policy:
                         # compute reference log_prob
                         with _timer('ref', timing_raw):
-                            ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
+                            ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch) # 参照ポリシーのlog_probを計算して、元のバッチに結合
                             batch = batch.union(ref_log_prob)
 
                     # compute values
                     if self.use_critic:
                         with _timer('values', timing_raw):
-                            values = self.critic_wg.compute_values(batch)
+                            values = self.critic_wg.compute_values(batch) # Criticで状態価値を計算して、元のバッチに結合（PPOのみ）
                             batch = batch.union(values)
 
                     with _timer('adv', timing_raw):
@@ -785,10 +808,11 @@ class RayPPOTrainer(object):
                             batch = batch.union(reward_tensor)
 
                         # we combine with rule-based rm
-                        reward_tensor = self.reward_fn(batch)
+                        reward_tensor = self.reward_fn(batch) # EMスコアによる報酬計算
                         batch.batch['token_level_scores'] = reward_tensor
 
                         # compute rewards. apply_kl_penalty if available
+                        # klペナルティを報酬に追加
                         if not self.config.actor_rollout_ref.actor.use_kl_loss:
                             batch, kl_metrics = apply_kl_penalty(batch,
                                                                  kl_ctrl=self.kl_ctrl,
@@ -798,13 +822,14 @@ class RayPPOTrainer(object):
                             batch.batch['token_level_rewards'] = batch.batch['token_level_scores']
 
                         # compute advantages, executed on the driver process
+                        # GAE / GRPOの優位性計算を行い、元のバッチに結合
                         batch = compute_advantage(batch,
                                                   adv_estimator=self.config.algorithm.adv_estimator,
                                                   gamma=self.config.algorithm.gamma,
                                                   lam=self.config.algorithm.lam,
                                                   num_repeat=self.config.actor_rollout_ref.rollout.n)
 
-                    # update critic
+                    # update critic、Criticの更新を行う
                     if self.use_critic:
                         with _timer('update_critic', timing_raw):
                             critic_output = self.critic_wg.update_critic(batch)
@@ -815,9 +840,10 @@ class RayPPOTrainer(object):
                     if self.config.trainer.critic_warmup <= self.global_steps:
                         # update actor
                         with _timer('update_actor', timing_raw):
+                            # Search-R1 特有、<information>部分をマスクする
                             if self.config.do_search and self.config.actor_rollout_ref.actor.state_masking:
                                 batch, metrics = self._create_loss_mask(batch, metrics)
-                            actor_output = self.actor_rollout_wg.update_actor(batch)
+                            actor_output = self.actor_rollout_wg.update_actor(batch) # Actorの更新を行う
                         actor_output_metrics = reduce_metrics(actor_output.meta_info['metrics'])
                         metrics.update(actor_output_metrics)
 
@@ -852,7 +878,13 @@ class RayPPOTrainer(object):
                     return
     
     def _create_loss_mask(self, batch, metrics):
-        """Create loss mask for state tokens."""
+        """
+        Search-R1 extension.
+
+        `info_mask` is prepared by Search-R1 trajectory construction and marks
+        retrieval-observation segments. This function exports `loss_mask` for
+        actor update so optimization can focus on desired token regions.
+        """
         response_length = batch.batch['responses'].shape[-1]
         response_mask = batch.batch['attention_mask'][:, -response_length:]
         

@@ -156,18 +156,28 @@ def collate_fn(x: list['DataProtoItem']):
 @dataclass
 class DataProtoItem:
     # TODO(zhangchi.usc1992) add consistency check
-    batch: TensorDict = None
-    non_tensor_batch: Dict = field(default_factory=dict)
-    meta_info: Dict = field(default_factory=dict)
+    batch: TensorDict = None # input_ids, attention_mask, rewardsなどのTensorを入れる
+    non_tensor_batch: Dict = field(default_factory=dict) # data_source ('nq', 'gsm8k'など), reward_model (ground_truthなど)など
+    meta_info: Dict = field(default_factory=dict) # eos_token_idなどのバッチサイズに依存しない設定値を入れる
 
 
 @dataclass
 class DataProto:
     """
-    A DataProto is a data structure that aims to provide a standard protocol for data exchange between functions.
-    It contains a batch (TensorDict) and a meta_info (Dict). The batch is a TensorDict https://pytorch.org/tensordict/.
-    TensorDict allows you to manipulate a dictionary of Tensors like a single Tensor. Ideally, the tensors with the
-    same batch size should be put inside batch.
+    VERLではActor・Critic・Rollout・RewardModelなど複数のWorkerがRay上で動いており、
+    それぞれが別プロセス（別GPU）にいる。DataProtoはそのWorker間を行き来するデータの入れ物。
+
+    フィールドは3つ：
+      batch           : GPU Tensor用（input_ids, attention_mask, rewards, log_probsなど）
+                        TensorDictなので辞書のように名前でアクセスしつつ、Tensorとして一括操作できる
+      non_tensor_batch: テキストなどTensorにできないデータ用（numpy array of objects）
+                        例: 生成されたテキスト文字列、検索クエリなど
+      meta_info       : バッチサイズに依存しない設定値など（例: {"eos_token_id": 2}）
+
+    使われ方のイメージ:
+      rollout worker が生成した (input_ids, attention_mask, responses) を DataProto に詰めて
+      → reward worker に渡して報酬を計算させ
+      → actor worker に渡して方策を更新する
     """
     batch: TensorDict = None
     non_tensor_batch: Dict = field(default_factory=dict)
@@ -192,6 +202,8 @@ class DataProto:
         return DataProtoItem(batch=tensor_data, non_tensor_batch=non_tensor_data, meta_info=self.meta_info)
 
     def __getstate__(self):
+        # Rayが別プロセス間でDataProtoを転送するときに呼ばれるシリアライズ処理
+        # TensorDictをbytesに変換してpickle可能な状態にする
         import io
         buffer = io.BytesIO()
         if tensordict.__version__ >= '0.5.0' and self.batch is not None:
@@ -202,6 +214,7 @@ class DataProto:
         return buffer_bytes, self.non_tensor_batch, self.meta_info
 
     def __setstate__(self, data):
+        # Rayが受け取り側でDataProtoを復元するときに呼ばれるデシリアライズ処理
         import io
         batch_deserialized_bytes, non_tensor_batch, meta_info = data
         batch_deserialized = io.BytesIO(initial_bytes=batch_deserialized_bytes)
@@ -595,15 +608,21 @@ import ray
 @dataclass
 class DataProtoFuture:
     """
-    DataProtoFuture aims to eliminate actual data fetching on driver. By doing so, the driver doesn't have to wait
-    for data so that asynchronous execution becomes possible. 
-    DataProtoFuture contains a list of futures from another WorkerGroup of size world_size.
-    - collect_fn is a Callable that reduces the list of futures to a DataProto
-    - dispatch_fn is a Callable that partitions the DataProto into a list of DataProto of size world_size and then select
+    DataProtoの非同期版。Rayのfuture（ObjectRef）を持ち、実際のデータ転送をWorker間で直接行う。
 
-    Potential issue: we can optimize dispatch_fn(collect_fn) such that only needed data is fetched on destination
-    - DataProtoFuture only supports directly passing from the output of a method to another input. You can't perform any
-    operation on the DataProtoFuture in driver.
+    通常のDataProtoだと:
+      Worker A → (データをdriverに送る) → driver → (データをWorker Bに送る)
+    と2回転送が発生してdriverがボトルネックになる。
+
+    DataProtoFutureだと:
+      Worker A → future参照だけdriverに返す → driverはfutureをそのままWorker Bに渡す
+      Worker B → ray.get()で実際のデータをWorker Aから直接取得
+    となりdriverを経由せずWorker同士が直接やりとりできる。
+
+    フィールド:
+      futures    : 各Worker（dp_size分）からのRay ObjectRefのリスト
+      collect_fn : futures（リスト）→ DataProto に変換する関数（通常はDataProto.concat）
+      dispatch_fn: DataProto → 必要な部分だけ切り出す関数（chunkなど）
     """
     collect_fn: Callable
     futures: List[ray.ObjectRef]

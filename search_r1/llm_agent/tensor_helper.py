@@ -32,6 +32,7 @@ class TensorHelper:
         sorted_indices = mask.to(torch.int64).argsort(dim=1, stable=True)
         return tensor.gather(1, sorted_indices), sorted_indices
 
+    # maskの正体。pad_tokenを0にする
     def create_attention_mask(self, input_ids: torch.Tensor) -> torch.Tensor:
         """Create attention mask from input ids."""
         return torch.where(input_ids != self.config.pad_token_id, 1, 0)
