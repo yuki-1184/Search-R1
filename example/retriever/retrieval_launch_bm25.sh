@@ -1,5 +1,5 @@
 
-file_path=/the/path/you/save/corpus
+file_path=/work02/satoki/searchr1_data/save/corpus
 index_file=$file_path/bm25
 corpus_file=$file_path/wiki-18.jsonl
 retriever_name=bm25

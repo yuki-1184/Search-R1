@@ -1,0 +1,100 @@
+Bootstrap: docker
+From: nvidia/cuda:12.1.1-devel-ubuntu22.04
+
+%labels
+    Author Search-R1
+    Description Search-R1 environment for ABCI / HPC clusters
+
+%environment
+    export LANG=C.UTF-8
+    export LC_ALL=C.UTF-8
+    export PATH=/opt/conda/bin:$PATH
+    export CUDA_HOME=/usr/local/cuda
+    export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
+    export PYTHONNOUSERSITE=1
+
+%post
+    # ── System packages ──
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        git \
+        curl \
+        wget \
+        ca-certificates \
+        libgomp1 \
+        libjpeg-dev \
+        libpng-dev \
+        && rm -rf /var/lib/apt/lists/*
+
+    # ── Miniforge (Python 3.10, conda-forge only — no Anaconda TOS) ──
+    wget -q https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64.sh -O /tmp/miniforge.sh
+    bash /tmp/miniforge.sh -b -p /opt/conda
+    rm /tmp/miniforge.sh
+    export PATH=/opt/conda/bin:$PATH
+    conda install -y python=3.10
+    conda clean -afy
+
+    # ── Pin numpy<2 globally via constraint so no package can override it ──
+    echo "numpy<2" > /tmp/constraints.txt
+    export PIP_CONSTRAINT=/tmp/constraints.txt
+
+    # ── setuptools (needed for pkg_resources used by torch) ──
+    pip install --no-cache-dir "setuptools>=69"
+
+    # ── vllm (installs matching torch automatically) ──
+    pip install --no-cache-dir "vllm==0.6.3"
+
+    # ── faiss-gpu (pip wheel for CUDA 12) ──
+    pip install --no-cache-dir faiss-gpu-cu12
+
+    # ── flash-attn (source build — matching the torch version pulled by vllm) ──
+    export CUDA_HOME=/usr/local/cuda
+    pip install --no-cache-dir flash-attn --no-build-isolation
+
+    # ── Other Search-R1 dependencies ──
+    pip install --no-cache-dir \
+        accelerate \
+        codetiming \
+        datasets \
+        dill \
+        hydra-core \
+        pandas \
+        pybind11 \
+        ray \
+        "tensordict<0.6" \
+        "transformers<4.48" \
+        wandb \
+        IPython \
+        matplotlib
+
+    # ── Remove constraint file ──
+    rm /tmp/constraints.txt
+    unset PIP_CONSTRAINT
+
+    # ── Install verl (Search-R1) in editable mode at runtime ──
+    # The project directory will be bind-mounted, so we skip install here.
+
+    # ── Cleanup ──
+    pip cache purge
+    conda clean -afy
+
+%runscript
+    exec python "$@"
+
+%help
+    Search-R1 Singularity container for ABCI / HPC.
+
+    Build:
+        singularity build search_r1.sif search_r1.def
+
+    Run (bind-mount the project and data):
+        singularity exec --nv \
+            --bind /work02/satoki/Search-R1:/workspace \
+            search_r1.sif \
+            python /workspace/infer.py
+
+    Interactive shell:
+        singularity shell --nv \
+            --bind /work02/satoki/Search-R1:/workspace \
+            search_r1.sif

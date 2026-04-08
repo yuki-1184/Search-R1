@@ -389,4 +389,5 @@ if __name__ == "__main__":
     retriever = get_retriever(config)
     
     # 3) Launch the server. By default, it listens on http://127.0.0.1:8000
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    port = int(os.environ.get("RETRIEVAL_PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)

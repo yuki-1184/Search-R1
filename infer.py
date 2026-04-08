@@ -1,3 +1,4 @@
+import os
 import transformers
 import torch
 import random
@@ -64,7 +65,8 @@ def search(query: str):
             "topk": 3,
             "return_scores": True
         }
-    results = requests.post("http://127.0.0.1:8000/retrieve", json=payload).json()['result']
+    port = os.environ.get("RETRIEVAL_PORT", "8000")
+    results = requests.post(f"http://127.0.0.1:{port}/retrieve", json=payload).json()['result']
                 
     def _passages2string(retrieval_result):
         format_reference = ''
@@ -102,8 +104,8 @@ while True:
         max_new_tokens=1024,
         stopping_criteria=stopping_criteria,
         pad_token_id=tokenizer.eos_token_id,
-        do_sample=True,
-        temperature=0.7
+        do_sample=False,
+        # temperature=0.9
     )
 
     if outputs[0][-1].item() in curr_eos:
