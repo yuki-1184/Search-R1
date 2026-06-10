@@ -126,3 +126,5 @@ log/
 
 .singularity-cache/
 .singularity-tmp/
+
+docs/paper/
