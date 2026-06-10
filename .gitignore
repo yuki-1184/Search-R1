@@ -123,3 +123,6 @@ log/
 
 # Singularity
 *.sif
+
+.singularity-cache/
+.singularity-tmp/

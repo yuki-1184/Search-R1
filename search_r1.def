@@ -18,11 +18,15 @@ From: nvidia/cuda:12.1.1-devel-ubuntu22.04
     export DEBIAN_FRONTEND=noninteractive
     apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
+        cmake \
         git \
         curl \
         wget \
         ca-certificates \
+        swig \
+        pkg-config \
         libgomp1 \
+        libopenblas-dev \
         libjpeg-dev \
         libpng-dev \
         && rm -rf /var/lib/apt/lists/*
@@ -39,14 +43,32 @@ From: nvidia/cuda:12.1.1-devel-ubuntu22.04
     echo "numpy<2" > /tmp/constraints.txt
     export PIP_CONSTRAINT=/tmp/constraints.txt
 
+    # ── Build tools from pip to avoid old distro versions (Ubuntu 22.04 has cmake 3.22) ──
+    pip install --no-cache-dir "cmake>=3.23.1"
+
     # ── setuptools (needed for pkg_resources used by torch) ──
     pip install --no-cache-dir "setuptools>=69"
 
     # ── vllm (installs matching torch automatically) ──
     pip install --no-cache-dir "vllm==0.6.3"
 
-    # ── faiss-gpu (pip wheel for CUDA 12) ──
-    pip install --no-cache-dir faiss-gpu-cu12
+    # ── Build FAISS GPU from source with explicit CUDA architectures ──
+    # Update FAISS_CUDA_ARCHS to match your target GPUs when needed.
+    export FAISS_CUDA_ARCHS="80;86;89;90"
+    rm -rf /tmp/faiss
+    git clone --depth 1 --branch v1.8.0 https://github.com/facebookresearch/faiss.git /tmp/faiss
+    cmake -S /tmp/faiss -B /tmp/faiss/build \
+        -DFAISS_ENABLE_GPU=ON \
+        -DFAISS_ENABLE_PYTHON=ON \
+        -DBUILD_TESTING=OFF \
+        -DFAISS_OPT_LEVEL=generic \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_CUDA_ARCHITECTURES="${FAISS_CUDA_ARCHS}" \
+        -DPython_EXECUTABLE=/opt/conda/bin/python
+    cmake --build /tmp/faiss/build --target faiss -j"$(nproc)"
+    cmake --build /tmp/faiss/build --target swigfaiss -j"$(nproc)"
+    pip install --no-cache-dir /tmp/faiss/build/faiss/python
+    rm -rf /tmp/faiss
 
     # ── flash-attn (source build — matching the torch version pulled by vllm) ──
     export CUDA_HOME=/usr/local/cuda
@@ -81,20 +103,3 @@ From: nvidia/cuda:12.1.1-devel-ubuntu22.04
 
 %runscript
     exec python "$@"
-
-%help
-    Search-R1 Singularity container for ABCI / HPC.
-
-    Build:
-        singularity build search_r1.sif search_r1.def
-
-    Run (bind-mount the project and data):
-        singularity exec --nv \
-            --bind /work02/satoki/Search-R1:/workspace \
-            search_r1.sif \
-            python /workspace/infer.py
-
-    Interactive shell:
-        singularity shell --nv \
-            --bind /work02/satoki/Search-R1:/workspace \
-            search_r1.sif

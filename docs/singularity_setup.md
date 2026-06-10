@@ -15,6 +15,10 @@ singularity build --fakeroot search_r1.sif search_r1.def
 
 ビルドには 30〜60 分程度かかる（flash-attn のソースビルドが大部分）。
 
+`no kernel image is available for execution on the device` が出る場合は、`search_r1.def` 内の
+`FAISS_CUDA_ARCHS` を対象GPUに合わせて再ビルドする。
+例: A100なら `80`、H100なら `90` を含める。
+
 ビルド済み SIF を共有する場合は、チームの共有ストレージにコピーして使ってもらう。
 
 ## 2. データの準備
@@ -110,6 +114,7 @@ bash run_infer.sh
 |------|-----------|
 | `FATAL: " ": executable file not found` | コマンドの `\` 改行後にスペースが入っている。1 行で実行するかスクリプトを使う |
 | `address already in use` | ポート 8000 が使用中。`RETRIEVAL_PORT=8001` で別ポートを使う |
+| `Faiss assertion ... no kernel image is available for execution on the device` | `faiss-gpu` とGPUアーキ不一致。`search_r1.def` の `FAISS_CUDA_ARCHS` を対象GPUに合わせて SIF を再ビルド |
 | `ImportError: flash_attn_2_cuda ... undefined symbol` | flash-attn と torch のバージョン不一致。SIF を再ビルドする |
 | ホスト側の Python パッケージが混入する | `search_r1.def` の `PYTHONNOUSERSITE=1` が設定されているか確認 |
 | `JSONDecodeError` (infer.py) | 検索サーバーが起動していない、またはポートが一致していない |
@@ -122,6 +127,6 @@ bash run_infer.sh
 | CUDA | 12.1.1 | ベースイメージ |
 | vllm | 0.6.3 | torch は vllm が自動で導入 |
 | flash-attn | (ソースビルド) | torch バージョンに合わせてビルド |
-| faiss-gpu | faiss-gpu-cu12 | pip wheel (ビルド不要) |
+| faiss-gpu | faiss v1.8.0 (source build) | `FAISS_CUDA_ARCHS` を指定してビルド |
 | transformers | < 4.48 | |
 | numpy | < 2 | torch 互換性のため |
