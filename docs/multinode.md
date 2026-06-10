@@ -49,8 +49,9 @@ More script examples can be found [here](https://github.com/PeterGriffinJin/Sear
 
 
 ```bash
-export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export CUDA_VISIBLE_DEVICES=0,1,2,3
 export DATA_DIR='data/nq_search'
+N_GPUS_PER_NODE=4
 
 WAND_PROJECT="Search-R1-release"
 RAY_DASHBOARD_ADDRESS="<address>:8265"
@@ -117,7 +118,7 @@ ray job submit --address=$RAY_DASHBOARD_ADDRESS \
     +trainer.val_only=false \
     +trainer.val_before_train=false \
     trainer.default_hdfs_dir=null \
-    trainer.n_gpus_per_node=8 \
+    trainer.n_gpus_per_node=$N_GPUS_PER_NODE \
     trainer.nnodes=$N_NODES \
     trainer.save_freq=100 \
     trainer.test_freq=100 \

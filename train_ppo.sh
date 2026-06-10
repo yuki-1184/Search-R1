@@ -1,5 +1,10 @@
-export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3}
 export DATA_DIR='data/nq_search'
+export N_GPUS_PER_NODE=${N_GPUS_PER_NODE:-$(echo "$CUDA_VISIBLE_DEVICES" | awk -F, '{print NF}')}
+export RETRIEVAL_PORT=${RETRIEVAL_PORT:-8000}
+export RAY_TMPDIR=${RAY_SHORT_TMPDIR:-/tmp/ray_${PJM_JOBID:-$$}}
+export TMPDIR=$RAY_TMPDIR
+mkdir -p "$RAY_TMPDIR"
 
 WAND_PROJECT='Search-R1'
 
@@ -74,7 +79,7 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     +trainer.val_only=false \
     +trainer.val_before_train=true \
     trainer.default_hdfs_dir=null \
-    trainer.n_gpus_per_node=8 \
+    trainer.n_gpus_per_node=$N_GPUS_PER_NODE \
     trainer.nnodes=1 \
     trainer.save_freq=100 \
     trainer.test_freq=50 \
@@ -85,6 +90,6 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     trainer.default_hdfs_dir=null \
     trainer.default_local_dir=verl_checkpoints/$EXPERIMENT_NAME \
     max_turns=2 \
-    retriever.url="http://127.0.0.1:8000/retrieve" \
+    retriever.url="http://127.0.0.1:${RETRIEVAL_PORT}/retrieve" \
     retriever.topk=3 \
     2>&1 | tee $EXPERIMENT_NAME.log

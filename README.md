@@ -125,6 +125,7 @@ bash retrieval_launch.sh
 (4) Run RL training (PPO) with Llama-3.2-3b-base.
 ```bash
 conda activate searchr1
+export CUDA_VISIBLE_DEVICES=0,1,2,3
 bash train_ppo.sh
 ```
 

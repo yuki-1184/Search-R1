@@ -1,7 +1,8 @@
 data_name=nq_hotpotqa_train
 
-export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3}
 export DATA_DIR=data/${data_name} # first download the data from https://huggingface.co/datasets/PeterJinGo/nq_hotpotqa_train
+N_GPUS_PER_NODE=${N_GPUS_PER_NODE:-$(echo "$CUDA_VISIBLE_DEVICES" | awk -F, '{print NF}')}
 
 WAND_PROJECT="Search-R1"
 RAY_DASHBOARD_ADDRESS="http://xx.xx.xx.xx:8265" # your head node address
@@ -61,7 +62,7 @@ ray job submit --address=$RAY_DASHBOARD_ADDRESS \
     +trainer.val_only=false \
     +trainer.val_before_train=false \
     trainer.default_hdfs_dir=null \
-    trainer.n_gpus_per_node=8 \
+    trainer.n_gpus_per_node=$N_GPUS_PER_NODE \
     trainer.nnodes=$N_NODES \
     trainer.save_freq=100 \
     trainer.test_freq=100 \

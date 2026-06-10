@@ -23,7 +23,7 @@ import re
 import numpy as np
 
 def _select_rm_score_fn(data_source):
-    if data_source in ['nq', 'triviaqa', 'popqa', 'hotpotqa', '2wikimultihopqa', 'musique', 'bamboogle']:
+    if data_source in ['nq', 'triviaqa', 'popqa', 'hotpotqa', '2wikimultihopqa', 'musique', 'bamboogle', 'smoke']:
         return qa_em.compute_score_em
     else:
         raise NotImplementedError
@@ -99,13 +99,17 @@ class RewardManager():
 
 import ray
 import hydra
+import os
 
 
 @hydra.main(config_path='config', config_name='ppo_trainer', version_base=None)
 def main(config):
     if not ray.is_initialized():
         # this is for local ray cluster
-        ray.init(runtime_env={'env_vars': {'TOKENIZERS_PARALLELISM': 'true', 'NCCL_DEBUG': 'WARN'}})
+        ray.init(
+            _temp_dir=os.environ.get('RAY_TMPDIR'),
+            runtime_env={'env_vars': {'TOKENIZERS_PARALLELISM': 'true', 'NCCL_DEBUG': 'WARN'}}
+        )
 
     ray.get(main_task.remote(config))
 
