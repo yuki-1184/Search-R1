@@ -323,6 +323,10 @@ class QueryRequest(BaseModel):
 
 app = FastAPI()
 
+@app.get("/health")
+def health_endpoint():
+    return {"status": "ok"}
+
 @app.post("/retrieve")
 def retrieve_endpoint(request: QueryRequest):
     """

@@ -1,5 +1,5 @@
 
-file_path=/work02/satoki/searchr1_data
+file_path=$HOME/searchr1_data
 index_file=$file_path/e5_Flat.index
 corpus_file=$file_path/wiki-18.jsonl
 retriever_name=e5
