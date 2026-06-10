@@ -102,11 +102,20 @@ class RewardManager():
 import ray
 import hydra
 import os
+import random
+import torch
 
 
 # ./config/ppo_trainer.yamlを読み込んで, mainに渡す
 @hydra.main(config_path='config', config_name='ppo_trainer', version_base=None)
 def main(config):
+    seed = config.trainer.get('seed', 1)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
     if not ray.is_initialized():
         # this is for local ray cluster
         ray.init(

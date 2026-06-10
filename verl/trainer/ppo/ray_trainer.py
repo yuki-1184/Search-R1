@@ -45,6 +45,7 @@ from verl.single_controller.base import Worker
 from verl.single_controller.ray import RayResourcePool, RayWorkerGroup, RayClassWithInitArgs
 from verl.single_controller.ray.base import create_colocated_worker_cls
 from verl.trainer.ppo import core_algos
+from verl.utils.reward_score import qa_em
 from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
 
 import re
@@ -382,9 +383,14 @@ class RayPPOTrainer(object):
                           config=OmegaConf.to_container(self.config, resolve=True))
 
     def _create_dataloader(self):
+        import torch
         from torch.utils.data import DataLoader
         # TODO: we have to make sure the batch size is divisible by the dp size
         from verl.utils.dataset.rl_dataset import RLHFDataset, collate_fn
+        seed = self.config.trainer.get('seed', 1)
+        train_generator = torch.Generator()
+        train_generator.manual_seed(seed)
+
         self.train_dataset = RLHFDataset(parquet_files=self.config.data.train_files,
                                          tokenizer=self.tokenizer,
                                          prompt_key=self.config.data.prompt_key,
@@ -403,7 +409,8 @@ class RayPPOTrainer(object):
                                            batch_size=self.config.data.train_batch_size,
                                            shuffle=self.config.data.shuffle_train_dataloader,
                                            drop_last=True,
-                                           collate_fn=collate_fn)
+                                           collate_fn=collate_fn,
+                                           generator=train_generator)
 
         self.val_dataset = RLHFDataset(parquet_files=self.config.data.val_files,
                                        tokenizer=self.tokenizer,
@@ -454,6 +461,47 @@ class RayPPOTrainer(object):
         import torch
         reward_tensor_lst = []
         data_source_lst = []
+        f1_score_lst = []
+        validation_records = []
+
+        def collect_validation_outputs(batch, reward_tensor):
+            batch_f1_scores = []
+            for i in range(len(batch)):
+                data_item = batch[i]
+                prompt_ids = data_item.batch['prompts']
+                prompt_length = prompt_ids.shape[-1]
+                valid_prompt_length = data_item.batch['attention_mask'][:prompt_length].sum()
+                valid_prompt_ids = prompt_ids[-valid_prompt_length:]
+
+                response_ids = data_item.batch['responses']
+                valid_response_length = data_item.batch['attention_mask'][prompt_length:].sum()
+                valid_response_ids = response_ids[:valid_response_length]
+
+                sequence_str = self.tokenizer.decode(torch.cat((valid_prompt_ids, valid_response_ids)))
+                response_str = self.tokenizer.decode(valid_response_ids)
+                ground_truth = data_item.non_tensor_batch['reward_model']['ground_truth']
+                targets = ground_truth['target']
+                answer = qa_em.extract_solution(sequence_str) or ''
+                em_score = reward_tensor[i].sum().item()
+                f1_score = qa_em.token_f1_check(answer, targets)
+                batch_f1_scores.append(f1_score)
+
+                extra_info = data_item.non_tensor_batch.get('extra_info', {})
+                record = {
+                    'data_source': str(data_item.non_tensor_batch.get('data_source', 'unknown')),
+                    'extra_info': extra_info,
+                    'prediction': answer,
+                    'targets': targets,
+                    'em': em_score,
+                    'token_f1': f1_score,
+                    'response': response_str,
+                }
+                for stat_key in ('turns_stats', 'valid_action_stats', 'valid_search_stats', 'active_mask'):
+                    stat_values = batch.meta_info.get(stat_key)
+                    if stat_values is not None and i < len(stat_values):
+                        record[stat_key] = stat_values[i]
+                validation_records.append(record)
+            return batch_f1_scores
 
         # Search-R1 extension config for multi-turn generation + retrieval.
         gen_config = GenerationConfig(
@@ -510,6 +558,7 @@ class RayPPOTrainer(object):
 
                 reward_tensor_lst.append(reward_tensor)
                 data_source_lst.append(test_batch.non_tensor_batch.get('data_source', ['unknown'] * reward_tensor.shape[0]))
+                f1_score_lst.extend(collect_validation_outputs(test_batch, reward_tensor))
         # Search-R1 path (tool use enabled): multi-turn generation loop.
         else:
             for batch_dict in self.val_dataloader:
@@ -546,21 +595,39 @@ class RayPPOTrainer(object):
 
                     reward_tensor_lst.append(reward_tensor)
                     data_source_lst.append(test_batch.non_tensor_batch.get('data_source', ['unknown'] * reward_tensor.shape[0]))
+                    f1_score_lst.extend(collect_validation_outputs(test_batch, reward_tensor))
 
         reward_tensor = torch.cat([rw.sum(-1) for rw in reward_tensor_lst], dim=0).cpu()  # (batch_size,)
         # reward_tensor = torch.cat(reward_tensor_lst, dim=0).sum(-1).cpu()  # (batch_size,)
         data_sources = np.concatenate(data_source_lst, axis=0)
+        f1_scores = np.asarray(f1_score_lst)
         # evaluate test_score based on data source
         data_source_reward = {}
+        data_source_f1 = {}
         for i in range(reward_tensor.shape[0]):
             data_source = data_sources[i]
             if data_source not in data_source_reward:
                 data_source_reward[data_source] = []
+                data_source_f1[data_source] = []
             data_source_reward[data_source].append(reward_tensor[i].item())
+            data_source_f1[data_source].append(f1_scores[i].item())
 
         metric_dict = {}
         for data_source, rewards in data_source_reward.items():
             metric_dict[f'val/test_score/{data_source}'] = np.mean(rewards)
+            metric_dict[f'val/token_f1/{data_source}'] = np.mean(data_source_f1[data_source])
+
+        validation_output_dir = self.config.trainer.get('validation_output_dir')
+        if validation_output_dir:
+            os.makedirs(validation_output_dir, exist_ok=True)
+            output_path = os.path.join(
+                validation_output_dir,
+                f'validation_step_{self.global_steps}.jsonl',
+            )
+            with open(output_path, 'w', encoding='utf-8') as output_file:
+                for record in validation_records:
+                    output_file.write(json.dumps(record, ensure_ascii=False, default=str) + '\n')
+            print(f'Wrote validation outputs to {output_path}')
 
         return metric_dict
 

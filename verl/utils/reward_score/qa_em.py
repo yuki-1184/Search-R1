@@ -15,6 +15,7 @@
 import re
 import string
 import random
+from collections import Counter
 
 def normalize_answer(s):
     def remove_articles(text):
@@ -44,6 +45,28 @@ def em_check(prediction, golden_answers):
             score = 1
             break
     return score
+
+
+def token_f1_check(prediction, golden_answers):
+    if isinstance(golden_answers, str):
+        golden_answers = [golden_answers]
+
+    prediction_tokens = normalize_answer(prediction).split()
+    best_score = 0.0
+    for golden_answer in golden_answers:
+        golden_tokens = normalize_answer(golden_answer).split()
+        common = Counter(prediction_tokens) & Counter(golden_tokens)
+        num_same = sum(common.values())
+        if not prediction_tokens or not golden_tokens:
+            score = float(prediction_tokens == golden_tokens)
+        elif num_same == 0:
+            score = 0.0
+        else:
+            precision = num_same / len(prediction_tokens)
+            recall = num_same / len(golden_tokens)
+            score = 2 * precision * recall / (precision + recall)
+        best_score = max(best_score, score)
+    return best_score
 
 
 def subem_check(prediction, golden_answers):

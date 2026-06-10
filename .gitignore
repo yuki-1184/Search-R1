@@ -128,3 +128,4 @@ log/
 .singularity-tmp/
 
 docs/paper/
+experiments/

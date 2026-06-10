@@ -14,7 +14,7 @@ Options:
   -w  Wait time sec   (default: ${WAIT_TIME:-3000})
 
 Example:
-  bash jobs/pjsub_interact.sh -r a-batch -t 04:00:00
+  bash jobs/pjsub_interact.sh -r a-batch -t 01:00:00
 EOF
 }
 
