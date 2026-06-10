@@ -22,6 +22,7 @@ from verl.trainer.ppo.ray_trainer import RayPPOTrainer
 import re
 import numpy as np
 
+# 特定データセットに対して、reward scoreの計算方法を選択
 def _select_rm_score_fn(data_source):
     if data_source in ['nq', 'triviaqa', 'popqa', 'hotpotqa', '2wikimultihopqa', 'musique', 'bamboogle', 'smoke']:
         return qa_em.compute_score_em
@@ -29,6 +30,7 @@ def _select_rm_score_fn(data_source):
         raise NotImplementedError
 
 
+# reward scoreの管理クラス
 class RewardManager():
     """The reward manager.
     """
@@ -58,7 +60,7 @@ class RewardManager():
 
             prompt_length = prompt_ids.shape[-1]
 
-            valid_prompt_length = data_item.batch['attention_mask'][:prompt_length].sum()
+            valid_prompt_length = data_item.batch['attention_mask'][:prompt_length].sum() # maskを除いたpromptの系列長
             valid_prompt_ids = prompt_ids[-valid_prompt_length:]
 
             response_ids = data_item.batch['responses']
@@ -69,10 +71,10 @@ class RewardManager():
             sequences = torch.cat((valid_prompt_ids, valid_response_ids))
             sequences_str = self.tokenizer.decode(sequences)
 
-            ground_truth = data_item.non_tensor_batch['reward_model']['ground_truth']
+            ground_truth = data_item.non_tensor_batch['reward_model']['ground_truth'] # 正解ラベル
 
             # select rm_score
-            data_source = data_item.non_tensor_batch['data_source']
+            data_source = data_item.non_tensor_batch['data_source'] # データセットの種類 (nq, gsm8kなど) --- これに基づいてreward scoreの計算方法を選択
             compute_score_fn = _select_rm_score_fn(data_source)
 
             score = compute_score_fn(solution_str=sequences_str, ground_truth=ground_truth, format_score=self.format_score)
@@ -102,6 +104,7 @@ import hydra
 import os
 
 
+# ./config/ppo_trainer.yamlを読み込んで, mainに渡す
 @hydra.main(config_path='config', config_name='ppo_trainer', version_base=None)
 def main(config):
     if not ray.is_initialized():
@@ -133,15 +136,15 @@ def main_task(config):
     # instantiate tokenizer
     from verl.utils import hf_tokenizer
     tokenizer = hf_tokenizer(local_path)
-
+    
     # define worker classes
-    if config.actor_rollout_ref.actor.strategy == 'fsdp':
+    if config.actor_rollout_ref.actor.strategy == 'fsdp': # fully shared data parallel（分散学習用）
         assert config.actor_rollout_ref.actor.strategy == config.critic.strategy
         from verl.workers.fsdp_workers import ActorRolloutRefWorker, CriticWorker
         from verl.single_controller.ray import RayWorkerGroup
         ray_worker_group_cls = RayWorkerGroup
 
-    elif config.actor_rollout_ref.actor.strategy == 'megatron':
+    elif config.actor_rollout_ref.actor.strategy == 'megatron': # 分散学習用, modelによって使い分けるのかな？
         assert config.actor_rollout_ref.actor.strategy == config.critic.strategy
         from verl.workers.megatron_workers import ActorRolloutRefWorker, CriticWorker
         from verl.single_controller.ray.megatron import NVMegatronRayWorkerGroup
@@ -158,6 +161,7 @@ def main_task(config):
         Role.RefPolicy: ray.remote(ActorRolloutRefWorker),
     }
 
+    # GPUリソースのプールを定義。全てのロールが同じGPUプールを共有する設定になっている。
     global_pool_id = 'global_pool'
     resource_pool_spec = {
         global_pool_id: [config.trainer.n_gpus_per_node] * config.trainer.nnodes,
@@ -184,6 +188,7 @@ def main_task(config):
         role_worker_mapping[Role.RewardModel] = ray.remote(RewardModelWorker)
         mapping[Role.RewardModel] = global_pool_id
 
+    # Training用のReward ManagerとValidation用のReward Managerを作成
     reward_fn = RewardManager(tokenizer=tokenizer, num_examine=0)
 
     # Note that we always use function-based RM for validation

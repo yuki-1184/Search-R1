@@ -51,6 +51,7 @@ class LLMGenerationManager:
             padding="longest"
         )['input_ids']
 
+    # <search>や<answer>で区切る処理
     def _postprocess_responses(self, responses: torch.Tensor) -> torch.Tensor:
         """Process responses to stop at search operation or answer operation."""
         responses_str = self.tokenizer.batch_decode(
@@ -74,6 +75,7 @@ class LLMGenerationManager:
         responses = self._batch_tokenize(responses_str)
         return responses, responses_str
 
+    
     def _process_next_obs(self, next_obs: List[str]) -> torch.Tensor:
         """Process next observations from environment."""
         
@@ -90,6 +92,9 @@ class LLMGenerationManager:
 
         return next_obs_ids
 
+    # マルチターン会話におけるrolling state（プロンプトとレスポンスの結合した実行状態）を更新する関数
+    # position_idsやattention_maskも同時に更新する
+    # Sliding Windowで次の生成に必要な実行状態の保持
     def _update_rolling_state(self, rollings: DataProto, cur_responses: torch.Tensor, 
                             next_obs_ids: torch.Tensor) -> Dict:
         """Update rolling state with new responses and observations."""
@@ -117,6 +122,9 @@ class LLMGenerationManager:
         
         return new_rollings
 
+    # response + informationを結合した通常の系列と、responseはそのままでinformationだけをマスクした系列の両方を作る関数
+    # 論文中のLoss Masking for Retrieved Tokenの実態
+    # 学習用には、<info></info>をマスクしたものを渡すことで、「LLMが自分で考えた言葉」と「検索エンジンが持ってきた言葉」を区別させ、検索結果そのものを学習させないようにする
     def _info_masked_concatenate_with_padding(self, 
                 prompt: torch.Tensor, 
                 prompt_with_mask: torch.Tensor, 
@@ -142,6 +150,8 @@ class LLMGenerationManager:
 
         return padded_tensor, padded_tensor_with_info
 
+    # 最終出力用バッファの更新を行う関数
+    # if next_obs_ids: rollout途中の状態更新、else: 最終出力用のright_sideの更新
     def _update_right_side(self, right_side: Dict, 
                           cur_responses: torch.Tensor,
                           next_obs_ids: torch.Tensor = None) -> Dict:
@@ -217,12 +227,19 @@ class LLMGenerationManager:
         padded_output.batch = trimmed_batch
         return padded_output
 
+    # 本体loop
+    # gen_batchはtrain_batch_size(512)分のプロンプトが入ったバッチ、{input_ids,attention_mask,position_ids}を持つ
     def run_llm_loop(self, gen_batch, initial_input_ids: torch.Tensor) -> Tuple[Dict, Dict]:
         """Run main LLM generation loop."""
         
+        # left_sideは最初の入力、right_sideは生成履歴を保持するバッファ
         original_left_side = {'input_ids': initial_input_ids[:, -self.config.max_start_length:]}
         original_right_side = {'responses': initial_input_ids[:, []], 'responses_with_info_mask': initial_input_ids[:, []]}
         
+        # active_maskは現在のrolling stateにおいて、どのサンプルがまだ生成を続けているかを示すマスク。
+        # turns_statsは各サンプルが何ターン目にいるかを示す統計。
+        # valid_action_statsは各サンプルが有効なアクションを取った回数、
+        # valid_search_statsは有効な検索を行った回数をカウントする統計。
         active_mask = torch.ones(gen_batch.batch['input_ids'].shape[0], dtype=torch.bool)
         turns_stats = torch.ones(gen_batch.batch['input_ids'].shape[0], dtype=torch.int)
         valid_action_stats = torch.zeros(gen_batch.batch['input_ids'].shape[0], dtype=torch.int)
@@ -264,6 +281,7 @@ class LLMGenerationManager:
             next_obs_ids = self._process_next_obs(next_obs)
             
             # Update states
+            # rollingsは次の生成に使う作業状態
             rollings = self._update_rolling_state(
                 rollings,
                 responses_ids,
@@ -274,7 +292,8 @@ class LLMGenerationManager:
                 responses_ids,
                 next_obs_ids
             )
-            
+        
+        # まだactiveなサンプルがある場合、最後の生成状態を最終出力用バッファに反映させる
         # final LLM rollout
         if active_mask.sum():
             rollings.batch = self.tensor_fn.cut_to_effective_len(
@@ -318,6 +337,9 @@ class LLMGenerationManager:
         
         return self._compose_final_output(original_left_side, original_right_side, meta_info)
 
+    # leftとrightを結合して最終出力を作る関数
+    # attention_maskの再計算など、最終出力をDataProto化、main_infoの付与まで行う
+    # そのままPPOの更新に使える形にする
     def _compose_final_output(self, left_side: Dict,
                             right_side: Dict,
                             meta_info: Dict) -> Tuple[Dict, Dict]:
@@ -350,6 +372,8 @@ class LLMGenerationManager:
         
         return final_output
 
+    # モデルの文字列出力をaction ( search / answer / invalid )に変換
+    # answerならdone=1, searchならdone=0で返す。invalidの場合はエラーメッセージを出力してdone=0で返す
     def execute_predictions(self, predictions: List[str], pad_token: str, active_mask=None, do_search=True) -> List[str]:
         """
         Execute predictions across multiple environments.
@@ -403,7 +427,8 @@ If I want to give the final answer, I should put the answer between <answer> and
         assert len(search_results) == 0
             
         return next_obs, dones, valid_action, is_search
-
+    
+    # actionsとcontentsを切り分けて返す
     def postprocess_predictions(self, predictions: List[Any]) -> Tuple[List[int], List[bool]]:
         """
         Process (text-based) predictions from llm into actions and validity flags.
